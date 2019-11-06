@@ -40,16 +40,16 @@ sudo dnf install gcc kernel-devel-${UNAME%.*} elfutils elfutils-devel
 Install the dependencies for the "kpatch-build" command:
 
 ```bash
-sudo dnf install pesign yum-utils openssl wget numactl-devel
+sudo dnf install pesign yum-utils openssl wget numactl-devel patchutils
 sudo dnf builddep kernel-${UNAME%.*}
 sudo dnf debuginfo-install kernel-${UNAME%.*}
+
+# required on ppc64le
+sudo dnf install gcc-plugin-devel
 
 # optional, but highly recommended
 sudo dnf install ccache
 ccache --max-size=5G
-
-# optional, for kpatch-test
-sudo dnf install patchutils
 ```
 
 #### RHEL 7
@@ -70,17 +70,18 @@ Install the dependencies for the "kpatch-build" command:
 sudo yum-config-manager --enable rhel-7-server-optional-rpms
 sudo yum install pesign yum-utils zlib-devel \
   binutils-devel newt-devel python-devel perl-ExtUtils-Embed \
-  audit-libs-devel numactl-devel pciutils-devel bison ncurses-devel
+  audit-libs-devel numactl-devel pciutils-devel bison ncurses-devel \
+  patchutils
 
 sudo yum-builddep kernel-${UNAME%.*}
 sudo debuginfo-install kernel-${UNAME%.*}
 
-# optional, but highly recommended
-sudo yum install https://dl.fedoraproject.org/pub/epel/7/x86_64/c/ccache-3.2.7-3.el7.x86_64.rpm
-ccache --max-size=5G
+# required on ppc64le
+sudo yum install gcc-plugin-devel
 
-# optional, for kpatch-test
-sudo yum install patchutils
+# optional, but highly recommended
+sudo yum install https://dl.fedoraproject.org/pub/epel/7/x86_64/Packages/c/ccache-3.3.4-1.el7.x86_64.rpm
+ccache --max-size=5G
 ```
 
 #### CentOS 7
@@ -100,7 +101,7 @@ Install the dependencies for the "kpatch-build" command:
 ```bash
 sudo yum install pesign yum-utils zlib-devel \
   binutils-devel newt-devel python-devel perl-ExtUtils-Embed \
-  audit-libs audit-libs-devel numactl-devel pciutils-devel bison
+  audit-libs audit-libs-devel numactl-devel pciutils-devel bison patchutils
 
 # enable CentOS 7 debug repo
 sudo yum-config-manager --enable debug
@@ -111,9 +112,6 @@ sudo debuginfo-install kernel-${UNAME%.*}
 # optional, but highly recommended - enable EPEL 7
 sudo yum install ccache
 ccache --max-size=5G
-
-# optional, for kpatch-test
-sudo yum install patchutils
 ```
 
 #### Oracle Linux 7
@@ -133,7 +131,7 @@ Install the dependencies for the "kpatch-build" command:
 ```bash
 sudo yum install pesign yum-utils zlib-devel \
   binutils-devel newt-devel python-devel perl-ExtUtils-Embed \
-  audit-libs numactl-devel pciutils-devel bison
+  audit-libs numactl-devel pciutils-devel bison patchutils
 
 # enable ol7_optional_latest repo
 sudo yum-config-manager --enable ol7_optional_latest
@@ -147,12 +145,9 @@ rpm -ivh https://oss.oracle.com/ol7/debuginfo/kernel-debuginfo-common-x86_64-$(u
 # optional, but highly recommended - enable EPEL 7
 sudo yum install ccache
 ccache --max-size=5G
-
-# optional, for kpatch-test
-sudo yum install patchutils
 ```
 
-#### Ubuntu 14.04
+#### Ubuntu
 
 *NOTE: You'll need about 15GB of free disk space for the kpatch-build cache in
 `~/.kpatch` and for ccache.*
@@ -166,8 +161,12 @@ apt-get install make gcc libelf-dev
 Install the dependencies for the "kpatch-build" command:
 
 ```bash
-apt-get install dpkg-dev devscripts
+apt-get install dpkg-dev devscripts elfutils
 apt-get build-dep linux
+
+# required on ppc64le
+# e.g., on Ubuntu 18.04 for gcc-7.3
+apt-get install gcc-7-plugin-dev
 
 # optional, but highly recommended
 apt-get install ccache
@@ -231,6 +230,10 @@ Install the dependencies for the "kpatch-build" command:
 
     apt-get install dpkg-dev
     apt-get build-dep linux
+
+    # required on ppc64le
+    # e.g., on stretch for gcc-6.3
+    apt-get install gcc-6-plugin-dev
 
     # optional, but highly recommended
     apt-get install ccache
@@ -459,11 +462,10 @@ Limitations
   supported.  kpatch-build will return an error if the patch attempts
   to do so.
 
-- Patches which modify statically allocated data are not supported.
-  kpatch-build will detect that and return an error.  (In the future
-  we will add a facility to support it.  It will probably require the
-  user to write code which runs at patch module loading time which manually
-  updates the data.)
+- Patches which modify statically allocated data are not directly supported.
+  kpatch-build will detect that and return an error.  This limitation can be
+  overcome by using callbacks or shadow variables, as described in the
+  [Patch Author Guide](doc/patch-author-guide.md).
 
 - Patches which change the way a function interacts with dynamically
   allocated data might be safe, or might not.  It isn't possible for
@@ -634,9 +636,27 @@ sys_nanosleep(), etc?**
 
 **Q. Can you patch out-of-tree modules?**
 
-- Yes, though it's currently a bit of a manual process.  See this
-  [message](https://www.redhat.com/archives/kpatch/2015-June/msg00004.html) on
-  the kpatch mailing list for more information.
+Yes! There's a few requirements, and the feature is still in its infancy.
+
+1. You need to use the `--oot-module` flag to specify the version of the
+module that's currently running on the machine.
+2. `--sourcedir` has to be passed with a directory containing the same
+version of code as the running module, all set up and ready to build with a
+`make` command. For example, some modules need `autogen.sh` and
+`./configure` to have been run with the appropriate flags to match the
+currently-running module.
+3. If the `Module.symvers` file for the out-of-tree module doesn't appear
+in the root of the provided source directory, a symlink needs to be created
+in that directory that points to its actual location.
+4. Usually you'll need to pass the `--target` flag as well, to specify the
+proper `make` target names.
+5. This has only been tested for a single out-of-tree module per patch, and
+not for out-of-tree modules with dependencies on other out-of-tree modules
+built separately.
+
+***Sample invocation***
+
+`kpatch-build --sourcedir ~/test/ --target default --oot-module /lib/modules/$(uname -r)/extra/test.ko test.patch`
 
 
 Get involved

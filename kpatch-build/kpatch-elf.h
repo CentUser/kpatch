@@ -50,7 +50,7 @@ struct section {
 	GElf_Shdr sh;
 	Elf_Data *data;
 	char *name;
-	int index;
+	unsigned int index;
 	enum status status;
 	int include;
 	int ignore;
@@ -70,10 +70,12 @@ struct section {
 struct symbol {
 	struct list_head list;
 	struct symbol *twin;
+	struct symbol *parent;
+	struct symbol *child;
 	struct section *sec;
 	GElf_Sym sym;
 	char *name;
-	int index;
+	unsigned int index;
 	unsigned char bind, type;
 	enum status status;
 	union {
@@ -89,7 +91,7 @@ struct rela {
 	struct symbol *sym;
 	unsigned int type;
 	int addend;
-	int offset;
+	unsigned int offset;
 	char *string;
 	bool need_dynrela;
 };
@@ -128,7 +130,8 @@ struct rela *find_rela_by_offset(struct section *relasec, unsigned int offset);
 		ERROR("malloc"); \
 	memset((_new), 0, sizeof(*(_new))); \
 	INIT_LIST_HEAD(&(_new)->list); \
-	list_add_tail(&(_new)->list, (_list)); \
+	if (_list) \
+		list_add_tail(&(_new)->list, (_list)); \
 }
 
 int offset_of_string(struct list_head *list, char *name);

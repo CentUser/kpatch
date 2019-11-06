@@ -13,7 +13,7 @@ fi
 
 declare -a args=("$@")
 
-if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
+if [[ "$TOOLCHAINCMD" =~ "gcc" ]] ; then
 	while [ "$#" -gt 0 ]; do
 		if [ "$1" = "-o" ]; then
 			obj="$2"
@@ -23,7 +23,8 @@ if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
 			[[ "$obj" = */.tmp_mc_*.o ]] && break;
 
 			[[ "$obj" = */.tmp_*.o ]] && obj="${obj/.tmp_/}"
-			case "$obj" in
+			relobj=${obj//$KPATCH_GCC_SRCDIR\//}
+			case "$relobj" in
 				*.mod.o|\
 				*built-in.o|\
 				*built-in.a|\
@@ -41,14 +42,15 @@ if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
 				arch/x86/entry/vdso/*|\
 				drivers/firmware/efi/libstub/*|\
 				arch/powerpc/kernel/prom_init.o|\
+				lib/*|\
 				.*.o|\
 				*/.lib_exports.o)
 					break
 					;;
 				*.o)
-					mkdir -p "$KPATCH_GCC_TEMPDIR/orig/$(dirname "$obj")"
-					[[ -e "$obj" ]] && cp -f "$obj" "$KPATCH_GCC_TEMPDIR/orig/$obj"
-					echo "$obj" >> "$KPATCH_GCC_TEMPDIR/changed_objs"
+					mkdir -p "$KPATCH_GCC_TEMPDIR/orig/$(dirname "$relobj")"
+					[[ -e "$obj" ]] && cp -f "$obj" "$KPATCH_GCC_TEMPDIR/orig/$relobj"
+					echo "$relobj" >> "$KPATCH_GCC_TEMPDIR/changed_objs"
 					break
 					;;
 				*)
@@ -62,10 +64,11 @@ elif [[ "$TOOLCHAINCMD" = "ld" ]] ; then
 	while [ "$#" -gt 0 ]; do
 		if [ "$1" = "-o" ]; then
 			obj="$2"
+			relobj=${obj//$KPATCH_GCC_SRCDIR\//}
 			case "$obj" in
 				*.ko)
-					mkdir -p "$KPATCH_GCC_TEMPDIR/module/$(dirname "$obj")"
-					cp -f "$obj" "$KPATCH_GCC_TEMPDIR/module/$obj"
+					mkdir -p "$KPATCH_GCC_TEMPDIR/module/$(dirname "$relobj")"
+					cp -f "$obj" "$KPATCH_GCC_TEMPDIR/module/$relobj"
 					break
 					;;
 				.tmp_vmlinux*|vmlinux)

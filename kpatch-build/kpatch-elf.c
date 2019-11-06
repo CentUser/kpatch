@@ -263,7 +263,7 @@ void kpatch_create_symbol_list(struct kpatch_elf *kelf)
 {
 	struct section *symtab;
 	struct symbol *sym;
-	int symbols_nr, index = 0;
+	unsigned int symbols_nr, index = 0;
 
 	symtab = find_section_by_name(&kelf->sections, ".symtab");
 	if (!symtab)
@@ -322,7 +322,7 @@ static void kpatch_find_func_profiling_calls(struct kpatch_elf *kelf)
 	list_for_each_entry(sym, &kelf->symbols, list) {
 		if (sym->type != STT_FUNC || !sym->sec || !sym->sec->rela)
 			continue;
-#ifdef __powerpc__
+#ifdef __powerpc64__
 		list_for_each_entry(rela, &sym->sec->rela->relas, list) {
 			if (!strcmp(rela->sym->name, "_mcount")) {
 				sym->has_func_profiling = 1;
@@ -332,7 +332,9 @@ static void kpatch_find_func_profiling_calls(struct kpatch_elf *kelf)
 #else
 		rela = list_first_entry(&sym->sec->rela->relas, struct rela,
 					list);
-		if (rela->type != R_X86_64_NONE ||
+		if ((rela->type != R_X86_64_NONE &&
+		     rela->type != R_X86_64_PC32 &&
+		     rela->type != R_X86_64_PLT32) ||
 		    strcmp(rela->sym->name, "__fentry__"))
 			continue;
 
@@ -452,7 +454,7 @@ int is_local_sym(struct symbol *sym)
 
 void print_strtab(char *buf, size_t size)
 {
-	int i;
+	size_t i;
 
 	for (i = 0; i < size; i++) {
 		if (buf[i] == 0)
@@ -565,6 +567,7 @@ void kpatch_create_strtab(struct kpatch_elf *kelf)
 void kpatch_create_symtab(struct kpatch_elf *kelf)
 {
 	struct section *symtab;
+	struct section *strtab;
 	struct symbol *sym;
 	char *buf;
 	size_t size;
@@ -598,7 +601,11 @@ void kpatch_create_symtab(struct kpatch_elf *kelf)
 	symtab->data->d_size = size;
 
 	/* update symtab section header */
-	symtab->sh.sh_link = find_section_by_name(&kelf->sections, ".strtab")->index;
+	strtab = find_section_by_name(&kelf->sections, ".strtab");
+	if (!strtab)
+		ERROR("missing .strtab section");
+
+	symtab->sh.sh_link = strtab->index;
 	symtab->sh.sh_info = nr_local;
 }
 
@@ -647,6 +654,7 @@ struct section *create_section_pair(struct kpatch_elf *kelf, char *name,
 	relasec->data = malloc(sizeof(*relasec->data));
 	if (!relasec->data)
 		ERROR("malloc");
+	relasec->data->d_type = ELF_T_RELA;
 
 	/* set section header */
 	relasec->sh.sh_type = SHT_RELA;
@@ -697,7 +705,7 @@ void kpatch_reindex_elements(struct kpatch_elf *kelf)
 {
 	struct section *sec;
 	struct symbol *sym;
-	int index;
+	unsigned int index;
 
 	index = 1; /* elf write function handles NULL section 0 */
 	list_for_each_entry(sec, &kelf->sections, list)
@@ -750,6 +758,7 @@ void kpatch_write_output_elf(struct kpatch_elf *kelf, Elf *elf, char *outfile)
 {
 	int fd;
 	struct section *sec;
+	struct section *shstrtab;
 	Elf *elfout;
 	GElf_Ehdr eh, ehout;
 	Elf_Scn *scn;
@@ -765,7 +774,7 @@ void kpatch_write_output_elf(struct kpatch_elf *kelf, Elf *elf, char *outfile)
 	if (!elfout)
 		ERROR("elf_begin");
 
-	if (!gelf_newehdr(elfout, gelf_getclass(kelf->elf)))
+	if (!gelf_newehdr(elfout, gelf_getclass(elf)))
 		ERROR("gelf_newehdr");
 
 	if (!gelf_getehdr(elfout, &ehout))
@@ -779,7 +788,12 @@ void kpatch_write_output_elf(struct kpatch_elf *kelf, Elf *elf, char *outfile)
 	ehout.e_machine = eh.e_machine;
 	ehout.e_type = eh.e_type;
 	ehout.e_version = EV_CURRENT;
-	ehout.e_shstrndx = find_section_by_name(&kelf->sections, ".shstrtab")->index;
+
+	shstrtab = find_section_by_name(&kelf->sections, ".shstrtab");
+	if (!shstrtab)
+		ERROR("missing .shstrtab section");
+
+	ehout.e_shstrndx = shstrtab->index;
 
 	/* add changed sections */
 	list_for_each_entry(sec, &kelf->sections, list) {
@@ -814,6 +828,9 @@ void kpatch_write_output_elf(struct kpatch_elf *kelf, Elf *elf, char *outfile)
 		printf("%s\n",elf_errmsg(-1));
 		ERROR("elf_update");
 	}
+
+	elf_end(elfout);
+	close(fd);
 }
 
 /*
@@ -830,17 +847,21 @@ void kpatch_elf_teardown(struct kpatch_elf *kelf)
 	struct rela *rela, *saferela;
 
 	list_for_each_entry_safe(sec, safesec, &kelf->sections, list) {
+		if (sec->twin)
+			sec->twin->twin = NULL;
 		if (is_rela_section(sec)) {
 			list_for_each_entry_safe(rela, saferela, &sec->relas, list) {
 				memset(rela, 0, sizeof(*rela));
 				free(rela);
 			}
-			memset(sec, 0, sizeof(*sec));
-			free(sec);
 		}
+		memset(sec, 0, sizeof(*sec));
+		free(sec);
 	}
 
 	list_for_each_entry_safe(sym, safesym, &kelf->symbols, list) {
+		if (sym->twin)
+			sym->twin->twin = NULL;
 		memset(sym, 0, sizeof(*sym));
 		free(sym);
 	}

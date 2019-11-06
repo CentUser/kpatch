@@ -58,6 +58,7 @@
 	!defined(CONFIG_HAVE_FENTRY) || \
 	!defined(CONFIG_MODULES) || \
 	!defined(CONFIG_SYSFS) || \
+	!defined(CONFIG_STACKTRACE) || \
 	!defined(CONFIG_KALLSYMS_ALL)
 #error "CONFIG_FUNCTION_TRACER, CONFIG_HAVE_FENTRY, CONFIG_MODULES, CONFIG_SYSFS, CONFIG_KALLSYMS_ALL kernel config options are required"
 #endif
@@ -80,6 +81,11 @@ struct kpatch_kallsyms_args {
 	unsigned long addr;
 	unsigned long count;
 	unsigned long pos;
+};
+
+struct kpatch_apply_patch_args {
+	struct kpatch_module *kpmod;
+	bool replace;
 };
 
 /* this is a double loop, use goto instead of break */
@@ -206,7 +212,8 @@ static inline int kpatch_compare_addresses(unsigned long stack_addr,
 }
 
 static int kpatch_backtrace_address_verify(struct kpatch_module *kpmod,
-					   unsigned long address)
+					   unsigned long address,
+					   bool replace)
 {
 	struct kpatch_func *func;
 	int i;
@@ -241,8 +248,11 @@ static int kpatch_backtrace_address_verify(struct kpatch_module *kpmod,
 	} while_for_each_linked_func();
 
 	/* in the replace case, need to check the func hash as well */
-	hash_for_each_rcu(kpatch_func_hash, i, func, node) {
-		if (func->op == KPATCH_OP_UNPATCH && !func->force) {
+	if (replace) {
+		hash_for_each_rcu(kpatch_func_hash, i, func, node) {
+			if (func->op != KPATCH_OP_UNPATCH || func->force)
+				continue;
+
 			ret = kpatch_compare_addresses(address,
 						       func->new_addr,
 						       func->new_size,
@@ -261,7 +271,8 @@ static int kpatch_backtrace_address_verify(struct kpatch_module *kpmod,
  *
  * This function is called from stop_machine() context.
  */
-static int kpatch_verify_activeness_safety(struct kpatch_module *kpmod)
+static int kpatch_verify_activeness_safety(struct kpatch_module *kpmod,
+					   bool replace)
 {
 	struct task_struct *g, *t;
 	int i;
@@ -283,7 +294,8 @@ static int kpatch_verify_activeness_safety(struct kpatch_module *kpmod)
 			if (trace.entries[i] == ULONG_MAX)
 				break;
 			ret = kpatch_backtrace_address_verify(kpmod,
-							      trace.entries[i]);
+							      trace.entries[i],
+							      replace);
 			if (ret)
 				goto out;
 		}
@@ -349,12 +361,17 @@ static inline void post_unpatch_callback(struct kpatch_object *object)
 /* Called from stop_machine */
 static int kpatch_apply_patch(void *data)
 {
-	struct kpatch_module *kpmod = data;
+	struct kpatch_apply_patch_args *args = data;
+	struct kpatch_module *kpmod;
 	struct kpatch_func *func;
+	struct hlist_node *tmp;
 	struct kpatch_object *object;
 	int ret;
+	int i;
 
-	ret = kpatch_verify_activeness_safety(kpmod);
+	kpmod = args->kpmod;
+
+	ret = kpatch_verify_activeness_safety(kpmod, args->replace);
 	if (ret) {
 		kpatch_state_finish(KPATCH_STATE_FAILURE);
 		return ret;
@@ -395,6 +412,19 @@ static int kpatch_apply_patch(void *data)
 		goto err;
 	}
 
+	/*
+	 * The new patch has been applied successfully. Remove the functions
+	 * provided by the replaced patches (if any) from hash, to make sure
+	 * they will not be executed anymore.
+	 */
+	if (args->replace) {
+		hash_for_each_safe(kpatch_func_hash, i, tmp, func, node) {
+			if (func->op != KPATCH_OP_UNPATCH)
+				continue;
+			hash_del_rcu(&func->node);
+		}
+	}
+
 	/* run any user-defined post-patch callbacks */
 	list_for_each_entry(object, &kpmod->objects, list)
 		post_patch_callback(object);
@@ -416,7 +446,7 @@ static int kpatch_remove_patch(void *data)
 	struct kpatch_object *object;
 	int ret;
 
-	ret = kpatch_verify_activeness_safety(kpmod);
+	ret = kpatch_verify_activeness_safety(kpmod, false);
 	if (ret) {
 		kpatch_state_finish(KPATCH_STATE_FAILURE);
 		return ret;
@@ -650,7 +680,11 @@ static int kpatch_find_external_symbol(const char *objname, const char *name,
 	sym = find_symbol(name, NULL, NULL, true, true);
 	preempt_enable();
 	if (sym) {
+#ifdef CONFIG_HAVE_ARCH_PREL32_RELOCATIONS
+		*addr = (unsigned long)offset_to_ptr(&sym->value_offset);
+#else
 		*addr = sym->value;
+#endif
 		return 0;
 	}
 
@@ -695,6 +729,7 @@ static int kpatch_write_relocations(struct kpatch_module *kpmod,
 		case R_X86_64_NONE:
 			continue;
 		case R_X86_64_PC32:
+		case R_X86_64_PLT32:
 			loc = dynrela->dest;
 			val = (u32)(dynrela->src + dynrela->addend -
 				    dynrela->dest);
@@ -969,11 +1004,40 @@ out:
 	return 0;
 }
 
+/*
+ * Remove the obsolete functions from the ftrace filter.
+ * Return 1 if one or more of such functions have 'force' flag set,
+ * 0 otherwise.
+ */
+static int kpatch_ftrace_remove_unpatched_funcs(void)
+{
+	struct kpatch_module *kpmod;
+	struct kpatch_func *func;
+	int force = 0;
+
+	list_for_each_entry(kpmod, &kpmod_list, list) {
+		do_for_each_linked_func(kpmod, func) {
+			if (func->op != KPATCH_OP_UNPATCH)
+				continue;
+			if (func->force)
+				force = 1;
+			WARN_ON(kpatch_ftrace_remove_func(func->old_addr));
+		} while_for_each_linked_func();
+	}
+
+	return force;
+}
+
 int kpatch_register(struct kpatch_module *kpmod, bool replace)
 {
-	int ret, i, force = 0;
+	int ret, i;
 	struct kpatch_object *object, *object_err = NULL;
 	struct kpatch_func *func;
+
+	struct kpatch_apply_patch_args args = {
+		.kpmod = kpmod,
+		.replace = replace,
+	};
 
 	if (!kpmod->mod || list_empty(&kpmod->objects))
 		return -EINVAL;
@@ -1026,24 +1090,18 @@ int kpatch_register(struct kpatch_module *kpmod, bool replace)
 	 * Idle the CPUs, verify activeness safety, and atomically make the new
 	 * functions visible to the ftrace handler.
 	 */
-	ret = stop_machine(kpatch_apply_patch, kpmod, NULL);
+	ret = stop_machine(kpatch_apply_patch, &args, NULL);
 
 	/*
-	 * For the replace case, remove any obsolete funcs from the hash and
-	 * the ftrace filter, and disable the owning patch module so that it
-	 * can be removed.
+	 * For the replace case, remove any obsolete funcs from the ftrace
+	 * filter, and disable the owning patch module so that it can be
+	 * removed.
 	 */
 	if (!ret && replace) {
 		struct kpatch_module *kpmod2, *safe;
+		int force;
 
-		hash_for_each_rcu(kpatch_func_hash, i, func, node) {
-			if (func->op != KPATCH_OP_UNPATCH)
-				continue;
-			if (func->force)
-				force = 1;
-			hash_del_rcu(&func->node);
-			WARN_ON(kpatch_ftrace_remove_func(func->old_addr));
-		}
+		force = kpatch_ftrace_remove_unpatched_funcs();
 
 		list_for_each_entry_safe(kpmod2, safe, &kpmod_list, list) {
 			if (kpmod == kpmod2)

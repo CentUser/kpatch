@@ -47,10 +47,31 @@
 #define HAVE_SYMPOS
 #endif
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0) &&			\
-     LINUX_VERSION_CODE <= KERNEL_VERSION(4, 15, 0)) ||			\
-    defined(RHEL_RELEASE_CODE)
-#define HAVE_IMMEDIATE
+#ifdef RHEL_RELEASE_CODE
+# if RHEL_RELEASE_CODE <= RHEL_RELEASE_VERSION(7, 5)
+#  define HAVE_IMMEDIATE
+# endif
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0) &&		\
+       LINUX_VERSION_CODE <= KERNEL_VERSION(4, 15, 0))
+# define HAVE_IMMEDIATE
+#endif
+
+#ifdef RHEL_RELEASE_CODE
+# if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(7, 5)
+#  define HAVE_CALLBACKS
+# endif
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
+# define HAVE_CALLBACKS
+#endif
+
+#ifdef RHEL_RELEASE_CODE
+# if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(7, 8) && 		\
+	 RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(8, 0)) || 		\
+      RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8, 2)
+#  define HAVE_SIMPLE_ENABLE
+# endif
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+# define HAVE_SIMPLE_ENABLE
 #endif
 
 /*
@@ -79,7 +100,9 @@ struct patch_object {
 	struct list_head list;
 	struct list_head funcs;
 	struct list_head relocs;
+#ifdef HAVE_CALLBACKS
 	struct klp_callbacks callbacks;
+#endif
 	const char *name;
 	int funcs_nr, relocs_nr;
 };
@@ -216,6 +239,7 @@ extern struct kpatch_post_patch_callback __kpatch_callbacks_post_patch[], __kpat
 extern struct kpatch_pre_unpatch_callback __kpatch_callbacks_pre_unpatch[], __kpatch_callbacks_pre_unpatch_end[];
 extern struct kpatch_post_unpatch_callback __kpatch_callbacks_post_unpatch[], __kpatch_callbacks_post_unpatch_end[];
 
+#ifdef HAVE_CALLBACKS
 static int add_callbacks_to_patch_objects(void)
 {
 	struct kpatch_pre_patch_callback *p_pre_patch_callback;
@@ -286,6 +310,24 @@ static int add_callbacks_to_patch_objects(void)
 
 	return 0;
 }
+#else /* HAVE_CALLBACKS */
+static inline int add_callbacks_to_patch_objects(void)
+{
+	if (__kpatch_callbacks_pre_patch !=
+	    __kpatch_callbacks_pre_patch_end ||
+	    __kpatch_callbacks_post_patch !=
+	    __kpatch_callbacks_post_patch_end ||
+	    __kpatch_callbacks_pre_unpatch !=
+	    __kpatch_callbacks_pre_unpatch_end ||
+	    __kpatch_callbacks_post_unpatch !=
+	    __kpatch_callbacks_post_unpatch_end) {
+		pr_err("patch callbacks are not supported\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+#endif /* HAVE_CALLBACKS */
 
 extern struct kpatch_patch_func __kpatch_funcs[], __kpatch_funcs_end[];
 #ifndef HAVE_ELF_RELOCS
@@ -343,7 +385,7 @@ static int __init patch_init(void)
 		goto out;
 	lpatch->mod = THIS_MODULE;
 	lpatch->objs = lobjects;
-#if defined(__powerpc__) && defined(HAVE_IMMEDIATE)
+#if defined(__powerpc64__) && defined(HAVE_IMMEDIATE)
 	lpatch->immediate = true;
 #endif
 
@@ -392,7 +434,9 @@ static int __init patch_init(void)
 		}
 #endif /* HAVE_ELF_RELOCS */
 
+#ifdef HAVE_CALLBACKS
 		lobject->callbacks = object->callbacks;
+#endif
 
 		i++;
 	}
@@ -403,15 +447,19 @@ static int __init patch_init(void)
 	 */
 	patch_free_scaffold();
 
+#ifndef HAVE_SIMPLE_ENABLE
 	ret = klp_register_patch(lpatch);
 	if (ret) {
 		patch_free_livepatch(lpatch);
 		return ret;
 	}
+#endif
 
 	ret = klp_enable_patch(lpatch);
 	if (ret) {
+#ifndef HAVE_SIMPLE_ENABLE
 		WARN_ON(klp_unregister_patch(lpatch));
+#endif
 		patch_free_livepatch(lpatch);
 		return ret;
 	}
@@ -425,7 +473,10 @@ out:
 
 static void __exit patch_exit(void)
 {
+#ifndef HAVE_SIMPLE_ENABLE
 	WARN_ON(klp_unregister_patch(lpatch));
+#endif
+	patch_free_livepatch(lpatch);
 }
 
 module_init(patch_init);

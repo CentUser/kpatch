@@ -25,8 +25,8 @@
 
 INSTALLDIR=/var/lib/kpatch
 SCRIPTDIR="$(readlink -f "$(dirname "$(type -p "$0")")")"
-VERSION="0.5.0"
-POST_ENABLE_WAIT=5	# seconds
+VERSION="0.8.0"
+POST_ENABLE_WAIT=15	# seconds
 POST_SIGNAL_WAIT=60	# seconds
 
 # How many times to try loading the patch if activeness safety check fails.
@@ -126,7 +126,7 @@ find_core_module() {
 }
 
 core_loaded () {
-	grep -q -e "T klp_register_patch" -e "T kpatch_register" /proc/kallsyms
+	grep -q -e "T klp_enable_patch" -e "T kpatch_register" /proc/kallsyms
 }
 
 get_module_name () {
@@ -157,7 +157,7 @@ verify_module_checksum () {
 	checksum="$(readelf -p .kpatch.checksum "$1" 2>&1 | grep '\[.*\]' | awk '{print $3}')"
 
 	# Fail checksum match only if both exist and diverge
-	if [[ ! -z "$checksum" ]] && [[ -e "$SYSFS/${modname}/checksum" ]] ; then
+	if [[ -n "$checksum" ]] && [[ -e "$SYSFS/${modname}/checksum" ]] ; then
 		sysfs_checksum="$(cat "$SYSFS/${modname}/checksum")"
 		[[ "$checksum" == "$sysfs_checksum" ]] || return 1
 	fi
@@ -230,21 +230,8 @@ signal_stalled_processes() {
 	[[ -z "$module" ]] && return
 
 	if [[ -e "/sys/kernel/livepatch/$module/signal" ]] ; then
+		echo "signaling stalled process(es):"
 		echo 1 > "/sys/kernel/livepatch/$module/signal"
-	else
-		for proc_task in /proc/[0-9]*/task/[0-9]*; do
-			tid=${proc_task#*/task/}
-			if is_stalled "$module" "$tid" ; then
-				if [[ "$tid" -eq "$$" ]] ; then
-					echo "skipping pid $tid $(cat "$proc_task"/comm 2>/dev/null)"
-				else
-					echo "signaling pid $tid $(cat "$proc_task"/comm 2>/dev/null)"
-					kill -SIGSTOP "$tid"
-					sleep .1
-					kill -SIGCONT "$tid"
-				fi
-			fi
-		done
 	fi
 }
 
@@ -263,7 +250,7 @@ wait_for_patch_transition() {
 		sleep 1s
 	done
 
-	echo "patch transition has stalled, signaling stalled process(es):"
+	echo "patch transition has stalled!"
 	signal_stalled_processes
 
 	echo "waiting (up to $POST_SIGNAL_WAIT seconds) for patch transition to complete..."
@@ -314,30 +301,30 @@ load_module () {
 				die "error: cannot re-enable patch module $modname, cannot verify checksum match"
 			fi
 		else
-			die "error: module named $modname already loaded and enabled"
+			echo "module named $modname already loaded and enabled"
 		fi
+	else
+		echo "loading patch module: $module"
+		local i=0
+		while true; do
+			out="$(LC_ALL=C insmod "$module" 2>&1)"
+			[[ -z "$out" ]] && break
+			echo "$out" 1>&2
+			[[ ! "$out" =~ "Device or resource busy" ]] &&
+				die "failed to load module $module"
+
+			# "Device or resource busy" means the activeness safety check
+			# failed.  Retry in a few seconds.
+			i=$((i+1))
+			if [[ $i -eq $MAX_LOAD_ATTEMPTS ]]; then
+				die "failed to load module $module"
+				break
+			else
+				warn "retrying..."
+				sleep $RETRY_INTERVAL
+			fi
+		done
 	fi
-
-	echo "loading patch module: $module"
-	local i=0
-	while true; do
-		out="$(LC_ALL=C insmod "$module" 2>&1)"
-		[[ -z "$out" ]] && break
-		echo "$out" 1>&2
-		[[ ! "$out" =~ "Device or resource busy" ]] &&
-			die "failed to load module $module"
-
-		# "Device or resource busy" means the activeness safety check
-		# failed.  Retry in a few seconds.
-		i=$((i+1))
-		if [[ $i -eq $MAX_LOAD_ATTEMPTS ]]; then
-			die "failed to load module $module"
-			break
-		else
-			warn "retrying..."
-			sleep $RETRY_INTERVAL
-		fi
-	done
 
 	if ! wait_for_patch_transition "$modname" ; then
 		echo "module $modname did not complete its transition, unloading..."
@@ -352,7 +339,10 @@ disable_patch () {
 	local modname="$1"
 
 	local enabled="$SYSFS/$modname/enabled"
-	[[ -e "$enabled" ]] || die "patch module $1 is not loaded"
+	if ! [[ -e "$enabled" ]]; then
+	    warn "patch module $modname is not loaded"
+	    return 1
+	fi
 
 	if [[ "$(cat "$enabled")" -eq 1 ]]; then
 		echo "disabling patch module: $modname"
@@ -362,35 +352,44 @@ disable_patch () {
 			[[ -z "$out" ]] && break
 			echo "$out" 1>&2
 			if [[ ! "$out" =~ "Device or resource busy" ]]; then
-				die "failed to disable module $modname"
+				return 1
 			fi
 
 			# "Device or resource busy" means the activeness safety check
 			# failed.  Retry in a few seconds.
 			i=$((i+1))
 			if [[ $i -eq $MAX_LOAD_ATTEMPTS ]]; then
-				die "failed to disable module $modname"
+				return 1
 			else
 				warn "retrying..."
 				sleep $RETRY_INTERVAL
 			fi
 		done
 	fi
+}
+
+disable_patch_strict () {
+	local modname="$1"
+
+	disable_patch "$modname" || die "failed to disable module $modname"
 
 	if ! wait_for_patch_transition "$modname" ; then
 		die "transition stalled for $modname"
 	fi
 }
 
+remove_module () {
+	echo "unloading patch module: $1"
+	# ignore any error here because rmmod can fail if the module used
+	# KPATCH_FORCE_UNSAFE.
+	rmmod "$1" 2> /dev/null || return 0
+}
+
 unload_module () {
 	PATCH="${1//-/_}"
 	PATCH="${PATCH%.ko}"
-	disable_patch "$PATCH"
-
-	echo "unloading patch module: $PATCH"
-	# ignore any error here because rmmod can fail if the module used
-	# KPATCH_FORCE_UNSAFE.
-	rmmod "$PATCH" 2> /dev/null || return 0
+	disable_patch_strict "$PATCH"
+	remove_module "$PATCH"
 }
 
 get_module_version() {
@@ -428,10 +427,39 @@ case "$1" in
 	[[ "$#" -ne 2 ]] && usage
 	case "$2" in
 	"--all")
-		for module in "$SYSFS"/*; do
-			[[ -e "$module" ]] || continue
-			unload_module "$(basename "$module")" || die "failed to unload module $module"
+		# Versions of linux < 5.1 livepatching require patches to be
+		# disabled in the inverse order in which they were enabled.
+		while true; do
+			nr_disabled=0
+			for module in "$SYSFS"/*; do
+				modname="$(basename "$module")"
+
+				[[ -e "$module" ]] || continue
+				disable_patch "$modname" || continue
+				if ! wait_for_patch_transition "$modname" ; then
+				    warn "transition stalled for $modname"
+				    continue
+				fi
+				remove_module "$modname"
+				nr_disabled=$((nr_disabled + 1))
+			done
+			if [ $nr_disabled -eq 0 ]; then
+				break
+			fi
 		done
+
+		nr_remaining=0
+		for module in "$SYSFS"/*; do
+			modname="$(basename "$module")"
+
+			[[ -e "$module" ]] || continue
+			nr_remaining=$((nr_remaining + 1))
+			warn "failed to unload module $modname"
+		done
+
+		if [ $nr_remaining -gt 0 ]; then
+			exit 1
+		fi
 		;;
 	*)
 		unload_module "$(basename "$2")" || die "failed to unload module $2"
@@ -469,7 +497,7 @@ case "$1" in
 	echo "installing $PATCH ($KVER)"
 	mkdir -p "$INSTALLDIR/$KVER" || die "failed to create install directory"
 	cp -f "$PATCH" "$INSTALLDIR/$KVER" || die "failed to install module $PATCH"
-	systemctl enable kpatch.service
+	command -v systemctl > /dev/null 2>&1 && systemctl enable kpatch.service
 	;;
 
 "uninstall")
@@ -533,7 +561,7 @@ case "$1" in
 	echo "Installed patch modules:"
 	for kdir in "$INSTALLDIR"/*; do
 		[[ -e "$kdir" ]] || continue
-		for module in "$kdir"/*; do
+		for module in "$kdir"/*.ko; do
 			[[ -e "$module" ]] || continue
 			mod_name "$module"
 			echo "$MODNAME ($(basename "$kdir"))"

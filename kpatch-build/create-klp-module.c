@@ -57,9 +57,7 @@ static struct symbol *find_or_add_ksym_to_symbols(struct kpatch_elf *kelf,
 	if (!rela)
 		ERROR("name of ksym not found?");
 
-	name = strdup(strings + rela->addend);
-	if (!name)
-		ERROR("strdup");
+	name = strings + rela->addend;
 
 	/* Get objname of ksym */
 	rela = find_rela_by_offset(ksymsec->rela,
@@ -67,9 +65,7 @@ static struct symbol *find_or_add_ksym_to_symbols(struct kpatch_elf *kelf,
 	if (!rela)
 		ERROR("objname of ksym not found?");
 
-	objname = strdup(strings + rela->addend);
-	if (!objname)
-		ERROR("strdup");
+	objname = strings + rela->addend;
 
 	snprintf(pos, 32, "%lu", ksym->pos);
 	/* .klp.sym.objname.name,pos */
@@ -81,7 +77,7 @@ static struct symbol *find_or_add_ksym_to_symbols(struct kpatch_elf *kelf,
 			return sym;
 	}
 
-	ALLOC_LINK(sym, &kelf->symbols);
+	ALLOC_LINK(sym, NULL);
 	sym->name = strdup(buf);
 	if (!sym->name)
 		ERROR("strdup");
@@ -93,6 +89,25 @@ static struct symbol *find_or_add_ksym_to_symbols(struct kpatch_elf *kelf,
 	 */
 	sym->sym.st_shndx = SHN_LIVEPATCH;
 	sym->sym.st_info = GELF_ST_INFO(sym->bind, sym->type);
+	/*
+	 * Figure out where to put the new symbol:
+	 *   a) locals need to be grouped together, before globals
+	 *   b) globals can be tacked into the end of the list
+	 */
+	if (is_local_sym(sym)) {
+		struct list_head *head;
+		struct symbol *s;
+
+		head = &kelf->symbols;
+		list_for_each_entry(s, &kelf->symbols, list) {
+			if (!is_local_sym(s))
+				break;
+			head = &s->list;
+		}
+		list_add_tail(&sym->list, head);
+	} else {
+		list_add_tail(&sym->list, &kelf->symbols);
+	}
 
 	return sym;
 }
@@ -183,9 +198,7 @@ static void create_klp_relasecs_and_syms(struct kpatch_elf *kelf, struct section
 		if (!rela)
 			ERROR("find_rela_by_offset");
 
-		objname = strdup(strings + rela->addend);
-		if (!objname)
-			ERROR("strdup");
+		objname = strings + rela->addend;
 
 		/* Get the .kpatch.symbol entry for the rela src */
 		rela = find_rela_by_offset(krelasec->rela,
@@ -231,7 +244,6 @@ static void create_klp_relasecs_and_syms(struct kpatch_elf *kelf, struct section
 static void create_klp_arch_sections(struct kpatch_elf *kelf, char *strings)
 {
 	struct section *karch, *sec, *base = NULL;
-	struct kpatch_arch *entries;
 	struct rela *rela, *rela2;
 	char *secname, *objname = NULL;
 	char buf[256];
@@ -241,11 +253,10 @@ static void create_klp_arch_sections(struct kpatch_elf *kelf, char *strings)
 	if (!karch)
 		return;
 
-	entries = karch->data->d_buf;
-	nr = karch->data->d_size / sizeof(*entries);
+	nr = karch->data->d_size / sizeof(struct kpatch_arch);
 
 	for (index = 0; index < nr; index++) {
-		offset = index * sizeof(*entries);
+		offset = index * sizeof(struct kpatch_arch);
 
 		/* Get the base section (.parainstructions or .altinstructions) */
 		rela = find_rela_by_offset(karch->rela,
@@ -263,9 +274,7 @@ static void create_klp_arch_sections(struct kpatch_elf *kelf, char *strings)
 		if (!rela)
 			ERROR("find_rela_by_offset");
 
-		objname = strdup(strings + rela->addend);
-		if (!objname)
-			ERROR("strdup");
+		objname = strings + rela->addend;
 
 		/* Example: .klp.arch.vmlinux..parainstructions */
 		snprintf(buf, 256, "%s%s.%s", KLP_ARCH_PREFIX, objname, base->name);
@@ -292,6 +301,27 @@ static void create_klp_arch_sections(struct kpatch_elf *kelf, char *strings)
 		 * single .klp.arch.vmlinux..parainstructions section
 		 */
 		old_size = sec->data->d_size;
+
+		/*
+		 * Due to a quirk in how .parainstructions gets linked, the
+		 * section size doesn't encompass the last 4 bytes of the last
+		 * entry.  Align the old size properly before merging.
+		 */
+		if (!strcmp(base->name, ".parainstructions")) {
+			char *str;
+			static int align_mask = 0;
+
+			if (!align_mask) {
+				str = getenv("PARA_STRUCT_SIZE");
+				if (!str)
+					ERROR("PARA_STRUCT_SIZE not set");
+
+				align_mask = atoi(str) - 1;
+			}
+
+			old_size = (old_size + align_mask) & ~align_mask;
+		}
+
 		new_size = old_size + base->data->d_size;
 		sec->data->d_buf = realloc(sec->data->d_buf, new_size);
 		sec->data->d_size = new_size;
@@ -316,7 +346,7 @@ static void create_klp_arch_sections(struct kpatch_elf *kelf, char *strings)
  */
 static void remove_arch_sections(struct kpatch_elf *kelf)
 {
-	int i;
+	size_t i;
 	char *arch_sections[] = {
 		".parainstructions",
 		".rela.parainstructions",
@@ -331,7 +361,7 @@ static void remove_arch_sections(struct kpatch_elf *kelf)
 
 static void remove_intermediate_sections(struct kpatch_elf *kelf)
 {
-	int i;
+	size_t i;
 	char *intermediate_sections[] = {
 		".kpatch.symbols",
 		".rela.kpatch.symbols",
@@ -456,6 +486,9 @@ int main(int argc, char *argv[])
 
 	/* Rebuild rela sections, new klp rela sections will be rebuilt too. */
 	symtab = find_section_by_name(&kelf->sections, ".symtab");
+	if (!symtab)
+		ERROR("missing .symtab section");
+
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (!is_rela_section(sec))
 			continue;

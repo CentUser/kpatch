@@ -126,7 +126,7 @@ static void create_dynamic_rela_sections(struct kpatch_elf *kelf, struct section
 
 static void remove_intermediate_sections(struct kpatch_elf *kelf)
 {
-	int i;
+	size_t i;
 	char *intermediate_sections[] = {
 		".kpatch.symbols",
 		".rela.kpatch.symbols",
@@ -231,6 +231,9 @@ int main(int argc, char *argv[])
 	kpatch_reindex_elements(kelf);
 
 	symtab = find_section_by_name(&kelf->sections, ".symtab");
+	if (!symtab)
+		ERROR("missing .symtab section");
+
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (!is_rela_section(sec))
 			continue;
